@@ -1,36 +1,32 @@
 import time
 import requests
 import json
-from bs4 import BeautifulSoup
 import os
 import pickle
 from appdirs import user_data_dir
+import html
+
 
 # this script does create some files under this directory
 appname = "search_hoopla"
 appauthor = "Eshuigugu"
 data_dir = user_data_dir(appname, appauthor)
-
+cookies_filepath = os.path.join(data_dir, 'cookies.pkl')
+mam_blacklist_filepath = os.path.join(data_dir, 'blacklisted_ids.txt')
 
 if not os.path.isdir(data_dir):
     os.makedirs(data_dir)
-sess_filepath = os.path.join(data_dir, 'session.pkl')
 
-mam_blacklist_filepath = os.path.join(data_dir, 'blacklisted_ids.txt')
 if os.path.exists(mam_blacklist_filepath):
     with open(mam_blacklist_filepath, 'r') as f:
         blacklist = set([int(x.strip()) for x in f.readlines()])
 else:
     blacklist = set()
 
-if os.path.exists(sess_filepath):
-    sess = pickle.load(open(sess_filepath, 'rb'))
-    # only take the cookies
-    cookies = sess.cookies
-    sess = requests.Session()
+sess = requests.Session()
+if os.path.exists(cookies_filepath):
+    cookies = pickle.load(open(cookies_filepath, 'rb'))
     sess.cookies = cookies
-else:
-    sess = requests.Session()
 
 
 def search_hoopla(title, authors, category_str):
@@ -59,12 +55,19 @@ def search_hoopla(title, authors, category_str):
             time.sleep(10)
             continue
         time.sleep(1)
-        r_json = r.json()
 
-        if r.status_code == 200 and r_json['data']['search']['hits']:
-            for hoopla_item in r_json['data']['search']['hits']:
-                hoopla_item['url'] = f'https://www.hoopladigital.com/title/{hoopla_item["id"]}'
-            media_items += r_json['data']['search']['hits']
+        if r.status_code == 200:
+            try:
+                r_json = r.json()
+            except json.decoder.JSONDecodeError:
+                print('error loading reponse JSON', r.text)
+                continue
+            if r_json['data']['search']['hits']:
+                for hoopla_item in r_json['data']['search']['hits']:
+                    hoopla_item['url'] = f'https://www.hoopladigital.com/title/{hoopla_item["id"]}'
+                media_items += r_json['data']['search']['hits']
+        else:
+            print('bad response', r, r.text[:100])
     # ensure each result is unique
     media_items = list({x['url']: x for x in media_items}.values())
     return media_items
@@ -94,7 +97,7 @@ def get_mam_requests(limit=5000):
         }
         headers['Content-type'] = 'application/json; charset=utf-8'
 
-        r = sess.get(url, params=query_params, headers=headers)
+        r = sess.get(url, params=query_params, headers=headers, timeout=60)
         if r.status_code >= 300:
             raise Exception(f'error fetching requests. status code {r.status_code} {r.text}')
 
@@ -104,50 +107,63 @@ def get_mam_requests(limit=5000):
         keepGoing = min(total_items, limit) > start_idx and not \
             {x['id'] for x in req_books}.intersection(blacklist)
 
-    # saving the session lets you reuse the cookies returned by MAM which means you won't have to manually update the mam_id value as often
-    with open(sess_filepath, 'wb') as f:
-        pickle.dump(sess, f)
+    # save cookies for later
+    with open(cookies_filepath, 'wb') as f:
+        pickle.dump(sess.cookies, f)
 
     with open(mam_blacklist_filepath, 'a') as f:
         for book in req_books:
             f.write(str(book['id']) + '\n')
             book['url'] = 'https://www.myanonamouse.net/tor/viewRequest.php/' + \
                           str(book['id'])[:-5] + '.' + str(book['id'])[-5:]
-            book['title'] = BeautifulSoup(book["title"], features="lxml").text
-            book['authors'] = [author for k, author in json.loads(book['authors']).items()]
+            book['title'] = html.unescape(str(book['title']))
+            if book['authors']:
+                book['authors'] = [author for k, author in json.loads(book['authors']).items()]
     return req_books
+
+
+def should_search_for_book(mam_book):
+    return (mam_book['cat_name'].startswith('Ebooks ') or mam_book['cat_name'].startswith('Audiobooks '))\
+           and mam_book['filled'] == 0\
+           and mam_book['torsatch'] == 0\
+           and mam_book['category'] != 79\
+           and mam_book['id'] not in blacklist
+
+
+def search_for_mam_book(mam_book):
+    # category will be Ebooks, Audiobooks, or Comics
+    # skip newspapers/magazines
+    if mam_book['category'] == 61:
+        category = 'Comics'
+    else:
+        category = mam_book['cat_name'].split(' ')[0]
+
+    try:
+        return search_hoopla(mam_book['title'], mam_book['authors'], category)
+    except Exception as e:
+        print('error', e)
+        return
+
+
+def pretty_print_hits(mam_book, hits):
+    print(mam_book['title'])
+    print(' ' * 2 + mam_book['url'])
+    if len(hits) > 5:
+        print(' ' * 2 + f'got {len(hits)} hits')
+        print(' ' * 2 + f'showing first 5 results')
+        hits = hits[:5]
+    for hit in hits:
+        print(' ' * 2 + hit["title"])
+        print(' ' * 4 + hit['url'])
+    print()
 
 
 def main():
     req_books = get_mam_requests()
-
-    req_books_reduced = [x for x in req_books if
-                         (x['cat_name'].startswith('Ebooks ') or x['cat_name'].startswith('Audiobooks '))
-                         and x['filled'] == 0
-                         and x['torsatch'] == 0
-                         and x['id'] not in blacklist]
-    for book in req_books_reduced:
-        # category will be Ebooks, Audiobooks, or Comics
-        # skip newspapers/magazines
-        if book['category'] == 79:
-            continue
-        elif book['category'] == 61:
-            category = 'Comics'
-        else:
-            category = book['cat_name'].split(' ')[0]
-
-        hits = search_hoopla(book['title'], book['authors'], category)
+    for book in filter(should_search_for_book, req_books):
+        hits = search_for_mam_book(book)
         if hits:
-            print(book['title'])
-            print(' ' * 2 + book['url'])
-            if len(hits) > 5:
-                print(' ' * 2 + f'got {len(hits)} hits')
-                print(' ' * 2 + f'showing first 5 results')
-                hits = hits[:5]
-            for hit in hits:
-                print(' ' * 2 + hit['title'])
-                print(' ' * 4 + hit['url'])
-            print()
+            pretty_print_hits(book, hits)
 
 
 if __name__ == '__main__':
