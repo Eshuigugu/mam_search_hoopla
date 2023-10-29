@@ -7,7 +7,6 @@ from appdirs import user_data_dir
 import html
 import csv
 import argparse
-from typing import List
 
 # this script does create some files under this directory
 appname = "search_hoopla"
@@ -15,13 +14,15 @@ appauthor = "Eshuigugu"
 data_dir = user_data_dir(appname, appauthor)
 cookies_filepath = os.path.join(data_dir, 'cookies.pkl')
 resume_id_filepath = os.path.join(data_dir, 'resume_id.txt')
+map_mam_language_to_hoopla = {"ENG": 179283379, "SPA": 179283360, "FRE": 179283359, "GER": 179283371, "JPN": 179283380,
+                              "DUT": 179283390, "POR": 179283361}
 
 if not os.path.isdir(data_dir):
     os.makedirs(data_dir)
 
 if os.path.exists(resume_id_filepath):
     with open(resume_id_filepath, 'r') as f:
-        resume_id = max([int(x.strip()) for x in f.readlines()])
+        resume_id = int(f.read().strip())
 else:
     resume_id = 0
 
@@ -31,7 +32,7 @@ if os.path.exists(cookies_filepath):
     sess.cookies = cookies
 
 
-def search_hoopla(title: str, authors: List[str], category_str: str, subtitle: str = None) -> List[dict]:
+def search_hoopla(title: str, authors: list[str], category_str: str, subtitle: str = None, lang_id=None) -> list[dict]:
     media_items = []
     hoopla_endpoint_url = 'https://patron-api-gateway.hoopladigital.com/graphql'
     # KindId 5 is for ebooks, 8 is for audiobooks, 10 for comics
@@ -48,9 +49,18 @@ def search_hoopla(title: str, authors: List[str], category_str: str, subtitle: s
     for author in authors[:5]:
         json_payload = {'operationName': 'FilterSearch',
                         'variables': {'criteria': {"title": title, "artistName": author, 'kindId': str(category_int),
-                                                   'availability': 'ALL_TITLES',
+                                                   'availability': 'ALL_TITLES', "languageId": lang_id,
                                                    'pagination': {'page': 1, 'pageSize': 48}}},
-                        'query': r'''query FilterSearch($criteria: SearchCriteria!, $sort: Sort) {search(criteria: $criteria, sort: $sort) {    found    hits {      ...TitleListItemFragment      __typename    }    aggregations {      ...AggregationsFragment      __typename    }    algorithm    __typename  }}fragment AggregationsFragment on Facet {  name  buckets {    key    value    __typename  }  __typename}fragment TitleListItemFragment on Title {  id  artKey  issueNumberDescription  lendingMessage  kind {    name    __typename  }  parentalAdvisory  primaryArtist {    name    __typename  }  releaseDate  title  subtitle  titleId  status  licenseType  __typename}'''}
+                        'query': r'''query FilterSearch($criteria: SearchCriteria!, $sort: Sort)
+                        {search(criteria: $criteria, sort: $sort)
+                         {found    hits {      ...TitleListItemFragment      __typename    }
+                         aggregations {      ...AggregationsFragment      __typename    }
+                         algorithm    __typename  }}
+                         fragment AggregationsFragment on Facet {  name  buckets {    key    value    __typename  }  __typename}
+                         fragment TitleListItemFragment on Title {  id  artKey  issueNumberDescription  lendingMessage
+                         kind {    name    __typename  }
+                         releaseDate  title  subtitle  titleId  __typename language { name label id __typename }}'''}
+
         try:
             r = sess.post(hoopla_endpoint_url, json=json_payload, headers={'content-type': 'application/json'})
         except requests.ConnectionError as e:
@@ -85,10 +95,10 @@ def input_mam_id():
     headers = {"cookie": f"mam_id={mam_id}"}
     r = sess.get('https://www.myanonamouse.net/jsonLoad.php', headers=headers, timeout=5)  # test cookie
     if r.status_code != 200:
-        raise Exception(f'error fetching requests. status code {r.status_code} {r.text}')
+        raise Exception(f'Error communicating with API. status code {r.status_code} {r.text}')
 
 
-def search_mam(title, author, audiobook=False, ebook=False):
+def search_mam(title, author, lang_code=None, audiobook=False, ebook=False):
     mam_categories = []
     if audiobook:
         mam_categories.append(13)
@@ -99,7 +109,8 @@ def search_mam(title, author, audiobook=False, ebook=False):
     params = {
         "tor": {
             "text": f"@title {title} @author {author}",  # The search string.
-            "main_cat": mam_categories
+            "main_cat": mam_categories,
+            "browse_lang": [lang_code] if lang_code else []
         },
     }
     try:
@@ -113,7 +124,7 @@ def search_mam(title, author, audiobook=False, ebook=False):
     return False
 
 
-def get_mam_requests(limit: int = 5000) -> List[dict]:
+def get_mam_requests(limit: int = 10_000) -> list[dict]:
     keep_going = True
     start_idx = 0
     req_books = []
@@ -122,9 +133,6 @@ def get_mam_requests(limit: int = 5000) -> List[dict]:
     while keep_going:
         time.sleep(1)
         url = 'https://www.myanonamouse.net/tor/json/loadRequests.php'
-        headers = {}
-        # fill in mam_id for first run
-        # headers['cookie'] = 'mam_id='
         query_params = {
             'tor[text]': '',
             'tor[srchIn][title]': 'true',
@@ -134,17 +142,17 @@ def get_mam_requests(limit: int = 5000) -> List[dict]:
             'tor[startNumber]': f'{start_idx}',
             'tor[sortType]': 'dateD'
         }
-        headers['Content-type'] = 'application/json; charset=utf-8'
-
-        r = sess.get(url, params=query_params, headers=headers, timeout=60)
+        r = sess.get(url, params=query_params, headers={'Content-type': 'application/json; charset=utf-8'}, timeout=60)
         if r.status_code >= 300:
             print(f'error fetching requests. status code {r.status_code} {r.text}')
             if r.status_code == 403:
                 input_mam_id()
+                continue
 
-        req_books += r.json()['data']
-        total_items = r.json()['found']
-        start_idx += 100
+        response_json = r.json()
+        req_books += response_json['data']
+        total_items = response_json['found']
+        start_idx += response_json['perpage']
         # check that it's not returning requests already searched for
         keep_going = min(total_items, limit) > start_idx and not \
             min(book["id"] for book in req_books) <= resume_id
@@ -153,9 +161,12 @@ def get_mam_requests(limit: int = 5000) -> List[dict]:
     with open(cookies_filepath, 'wb') as f:
         pickle.dump(sess.cookies, f)
 
+    req_books = {book["id"]: book for book in req_books}  # make sure there's no duplicates the list of requested books
+    print(f'Got list of {len(req_books)} requested books')
     with open(resume_id_filepath, 'w') as resume_file:
         # arrange list of requests old > new
-        for book in req_books[::-1]:
+        for book_id in sorted(list(req_books)):
+            book = req_books[book_id]
             # write the most recent request id
             resume_file.seek(0)
             resume_file.write(str(book["id"]))
@@ -175,7 +186,7 @@ def should_search_for_book(mam_book: dict) -> bool:
            and mam_book['category'] != 79
 
 
-def search_for_mam_book(mam_book: dict) -> List[dict]:
+def search_for_mam_book(mam_book: dict) -> list[dict]:
     # category will be Ebooks, Audiobooks, or Comics
     # skip newspapers/magazines
     if mam_book['category'] == 61:
@@ -184,17 +195,20 @@ def search_for_mam_book(mam_book: dict) -> List[dict]:
         category = mam_book['cat_name'].split(' ')[0]
 
     try:
+        search_params = {}
+        if mam_book['lang_code'] in map_mam_language_to_hoopla:
+            search_params['lang_id'] = map_mam_language_to_hoopla[mam_book['lang_code']]
         if ': ' in mam_book['title']:
-            title, subtitle = mam_book['title'].split(': ', maxsplit=1)
-            return search_hoopla(title, mam_book['authors'], category, subtitle=subtitle)
+            title, search_params['subtitle'] = mam_book['title'].split(': ', maxsplit=1)
         else:
-            return search_hoopla(mam_book['title'], mam_book['authors'], category)
+            title = mam_book['title']
+        return search_hoopla(title=title, authors=mam_book['authors'], category_str=category, **search_params)
     except Exception as e:
         print('error', e)
         return []
 
 
-def pretty_print_hits(mam_book: dict, hits: List[dict]) -> None:
+def pretty_print_hits(mam_book: dict, hits: list[dict]) -> None:
     print(mam_book['title'])
     print(' ' * 2 + mam_book['url'])
     if len(hits) > 5:
@@ -207,26 +221,24 @@ def pretty_print_hits(mam_book: dict, hits: List[dict]) -> None:
     print()
 
 
-def write_to_csv(csv_filepath: str, book: dict, hits: List[dict]):
+def write_to_csv(csv_filepath: str, book: dict, hits: list[dict]):
     query_str = f'{book["title"]} {book["authors"][0]}'
+    goodreads_book = {}
     try:
         r = sess.get('https://www.goodreads.com/book/auto_complete', params={'format': 'json', 'q': query_str},
                      timeout=10)
+        if r.status_code == 200 and r.json():
+            goodreads_book = r.json()[0]
     except Exception as e:
         print('error querying goodreads', e)
-        r = None
-    if r.status_code == 200 and r.json():
-        goodreads_book = r.json()[0]
-    else:
-        goodreads_book = {}
     goodreads_book_url = f'https://www.goodreads.com{goodreads_book["bookUrl"]}' if "bookUrl" in goodreads_book else ""
     goodreads_num_ratings = goodreads_book.get("ratingsCount", "")
 
     on_mam = search_mam(book["title"], book["authors"][0],
                         ebook=book['cat_name'].startswith('Ebooks '),
-                        audiobook=book['cat_name'].startswith('Audiobooks ')
+                        audiobook=book['cat_name'].startswith('Audiobooks '),
+                        lang_code=book["language"]
                         )
-    # add series
     book_data = {
         "url": book["url"],
         "title": book["title"],
@@ -250,17 +262,22 @@ def write_to_csv(csv_filepath: str, book: dict, hits: List[dict]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Append data to a CSV file.")
-    parser.add_argument("--output_file", help="Path to the CSV output file (optional)")
-    args = parser.parse_args()
     for book in filter(should_search_for_book, get_mam_requests()):
         hits = search_for_mam_book(book)
         if hits:
             pretty_print_hits(book, hits)
-            if args.output_file:
-                write_to_csv(csv_filepath=args.output_file, book=book, hits=hits)
+            if output_file:
+                write_to_csv(csv_filepath=output_file, book=book, hits=hits)
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Append data to a CSV file.")
+    parser.add_argument("--output_file", help="Where to output a CSV file (optional)")
+    parser.add_argument("--after", type=int, default=resume_id,
+                        help="Filters out requests older than this request ID/timestamp in microseconds. "
+                             "Set to 0 to search for all requested books (optional)")
+    args = parser.parse_args()
+    resume_id = args.after
+    output_file = args.output_file
 
+    main()
